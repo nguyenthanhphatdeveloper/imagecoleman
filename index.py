@@ -8,9 +8,19 @@ Coleman async downloader
 
 import asyncio
 import logging
+import re
+import sys
 from pathlib import Path
 
 import aiofiles
+
+# Import tkinter cho file picker (có sẵn trong Python)
+try:
+    import tkinter as tk
+    from tkinter import filedialog
+    HAS_TKINTER = True
+except ImportError:
+    HAS_TKINTER = False
 import aiohttp
 from bs4 import BeautifulSoup
 from tqdm.asyncio import tqdm_asyncio
@@ -190,22 +200,172 @@ async def main(product_ids: list[str]):
         tasks = [handle_product(pid, sess, sem) for pid in product_ids]
         await tqdm_asyncio.gather(*tasks, desc="Tổng tiến độ", unit="sản phẩm")
 
+# ─────────── FILE PARSING ───────────
+def select_file_dialog() -> str | None:
+    """
+    Mở hộp thoại chọn file txt.
+    Trả về đường dẫn file hoặc None nếu hủy.
+    """
+    if not HAS_TKINTER:
+        return None
+    
+    try:
+        # Tạo root window ẩn
+        root = tk.Tk()
+        root.withdraw()  # Ẩn cửa sổ chính
+        root.attributes('-topmost', True)  # Đưa lên trên cùng
+        
+        # Mở file dialog
+        file_path = filedialog.askopenfilename(
+            title="Chọn file txt chứa mã sản phẩm",
+            filetypes=[
+                ("Text files", "*.txt"),
+                ("All files", "*.*")
+            ],
+            initialdir="."  # Bắt đầu từ thư mục hiện tại
+        )
+        
+        root.destroy()  # Đóng root window
+        
+        return file_path if file_path else None
+    
+    except Exception as e:
+        log.error("Lỗi mở file dialog: %s", e)
+        return None
+
+def parse_product_ids_from_file(file_path: str) -> list[str]:
+    """
+    Đọc mã sản phẩm từ file txt.
+    Hỗ trợ các định dạng: dấu phẩy, xuống dòng, hoặc dấu cách
+    """
+    try:
+        path = Path(file_path)
+        if not path.exists():
+            log.error("File không tồn tại: %s", file_path)
+            return []
+        
+        content = path.read_text(encoding="utf-8")
+        if not content.strip():
+            log.warning("File rỗng: %s", file_path)
+            return []
+        
+        # Tách theo nhiều delimiter: dấu phẩy, xuống dòng, dấu cách
+        # Sử dụng regex để tách theo tất cả các delimiter
+        ids = re.split(r'[,\s\n]+', content)
+        
+        # Lọc và làm sạch: chỉ lấy số, loại bỏ rỗng
+        product_ids = []
+        for item in ids:
+            cleaned = item.strip()
+            if cleaned and cleaned.isdigit():
+                product_ids.append(cleaned)
+        
+        # Loại bỏ trùng lặp nhưng giữ nguyên thứ tự
+        seen = set()
+        unique_ids = []
+        for pid in product_ids:
+            if pid not in seen:
+                seen.add(pid)
+                unique_ids.append(pid)
+        
+        log.info("Đã đọc %d mã sản phẩm từ file %s", len(unique_ids), file_path)
+        return unique_ids
+    
+    except Exception as e:
+        log.error("Lỗi đọc file %s: %s", file_path, e)
+        return []
+
 if __name__ == "__main__":
-    # 1) Nhập queue
     queue: list[str] = []
-    print("Nhập mã sản phẩm, gõ 'yes' để bắt đầu tải:")
-    while True:
-        s = input("> ").strip().lower()
-        if s == "yes":
-            break
-        elif s.isdigit():
-            queue.append(s)
-            print(f"✓ đã thêm {s}")
+    
+    print("=" * 50)
+    print("Coleman Product Downloader")
+    print("=" * 50)
+    print("Chọn chế độ:")
+    print("  1. Nhập mã thủ công")
+    print("  2. Đọc từ file txt")
+    print("=" * 50)
+    
+    mode = input("Chọn (1 hoặc 2): ").strip()
+    
+    if mode == "2":
+        # Đọc từ file
+        print("\nChọn file txt:")
+        print("  1. Chọn file từ hộp thoại (khuyến nghị)")
+        print("  2. Nhập đường dẫn thủ công")
+        print("  3. Dùng file mặc định 'products.txt'")
+        
+        choice = input("\nChọn (1/2/3): ").strip()
+        file_path = None
+        
+        if choice == "1":
+            # Chọn file từ dialog
+            if not HAS_TKINTER:
+                print("⚠️  tkinter không khả dụng, chuyển sang nhập thủ công...")
+                file_path = input("\nNhập đường dẫn file txt: ").strip()
+                if not file_path:
+                    print("❌ Không có đường dẫn. Thoát.")
+                    exit(1)
+            else:
+                print("\n📂 Đang mở hộp thoại chọn file...")
+                file_path = select_file_dialog()
+                if not file_path:
+                    print("❌ Không chọn file. Thoát.")
+                    exit(0)
+                print(f"✓ Đã chọn: {file_path}")
+        
+        elif choice == "2":
+            # Nhập đường dẫn thủ công
+            file_path = input("\nNhập đường dẫn file txt: ").strip()
+            if not file_path:
+                print("❌ Không có đường dẫn. Thoát.")
+                exit(1)
+        
+        elif choice == "3":
+            # Dùng file mặc định
+            file_path = "products.txt"
+            print(f"✓ Sử dụng file mặc định: {file_path}")
+        
         else:
-            print("⚠️  chỉ nhập số hoặc 'yes'.")
+            print("❌ Lựa chọn không hợp lệ. Thoát.")
+            exit(1)
+        
+        queue = parse_product_ids_from_file(file_path)
+        if not queue:
+            print(f"❌ Không đọc được mã nào từ file '{file_path}'")
+            print("   Kiểm tra lại đường dẫn và định dạng file.")
+            exit(1)
+        
+        print(f"\n✓ Đã đọc {len(queue)} mã sản phẩm từ file '{file_path}'")
+        print(f"  Danh sách: {', '.join(queue[:10])}{'...' if len(queue) > 10 else ''}")
+        confirm = input("\nBắt đầu tải? (yes/no): ").strip().lower()
+        if confirm != "yes":
+            print("Đã hủy.")
+            exit(0)
+    
+    elif mode == "1":
+        # Nhập thủ công
+        print("\nNhập mã sản phẩm (mỗi mã một dòng), gõ 'yes' để bắt đầu tải:")
+        while True:
+            s = input("> ").strip()
+            if s.lower() == "yes":
+                break
+            elif s.isdigit():
+                if s not in queue:  # Tránh trùng lặp
+                    queue.append(s)
+                    print(f"✓ đã thêm {s} (tổng: {len(queue)})")
+                else:
+                    print(f"⚠️  {s} đã có trong danh sách")
+            else:
+                print("⚠️  chỉ nhập số hoặc 'yes'.")
+    
+    else:
+        print("❌ Lựa chọn không hợp lệ. Thoát.")
+        exit(1)
 
     if not queue:
         print("Chưa có mã nào ➜ thoát.")
     else:
+        print(f"\n🚀 Bắt đầu tải {len(queue)} sản phẩm...\n")
         asyncio.run(main(queue))
         print("\n🎉  Xong! Kiểm tra các thư mục sản phẩm và file download.log.")
