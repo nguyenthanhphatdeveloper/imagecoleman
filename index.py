@@ -22,6 +22,7 @@ try:
 except ImportError:
     HAS_TKINTER = False
 import aiohttp
+from aiohttp import CookieJar
 from bs4 import BeautifulSoup
 from tqdm.asyncio import tqdm_asyncio
 from deep_translator import GoogleTranslator
@@ -44,25 +45,51 @@ log = logging.getLogger("coleman")
 
 
 # ─────────── NETWORK HELPERS ───────────
+def get_headers(referer: str | None = None) -> dict:
+    """Tạo headers giống browser để tránh 403"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7",
+        "Accept-Language": "ja,en-US;q=0.9,en;q=0.8",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none" if not referer else "same-origin",
+        "Sec-Fetch-User": "?1",
+        "Cache-Control": "max-age=0",
+    }
+    if referer:
+        headers["Referer"] = referer
+    return headers
+
 async def fetch_html(product_id: str, session: aiohttp.ClientSession, 
                      retries: int = MAX_RETRIES) -> str | None:
     url = f"https://ec.coleman.co.jp/item/{product_id}.html"
+    headers = get_headers()
     for attempt in range(retries):
         try:
-            async with session.get(url) as r:
+            async with session.get(url, headers=headers, allow_redirects=True) as r:
                 if r.status == 200:
                     return await r.text()
                 elif r.status == 404:
                     log.error("%s – không tìm thấy (404)", product_id)
                     return None
-                log.warning("%s – HTTP %s (lần thử %d/%d)", product_id, r.status, attempt + 1, retries)
+                elif r.status == 403:
+                    log.warning("%s – HTTP 403 Forbidden (lần thử %d/%d) - Có thể bị chặn bởi server", 
+                              product_id, attempt + 1, retries)
+                else:
+                    log.warning("%s – HTTP %s (lần thử %d/%d)", product_id, r.status, attempt + 1, retries)
         except asyncio.TimeoutError:
             log.warning("%s – timeout (lần thử %d/%d)", product_id, attempt + 1, retries)
         except Exception as e:
             log.warning("%s – lỗi: %s (lần thử %d/%d)", product_id, e, attempt + 1, retries)
         
         if attempt < retries - 1:
-            await asyncio.sleep(2 ** attempt)  # exponential backoff
+            # Thêm delay để tránh rate limiting, tăng dần theo số lần thử
+            delay = 2 ** attempt + 0.5  # Thêm 0.5s base delay
+            await asyncio.sleep(delay)
     
     log.error("%s – thất bại sau %d lần thử", product_id, retries)
     return None
@@ -82,9 +109,17 @@ async def download_image(url: str, path: Path,
             pass  # File có thể bị lỗi, tải lại
     
     async with sem:
+        # Headers cho ảnh
+        headers = get_headers(referer=f"https://ec.coleman.co.jp/item/{product_id}.html")
+        headers.update({
+            "Accept": "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+            "Sec-Fetch-Dest": "image",
+            "Sec-Fetch-Mode": "no-cors",
+        })
+        
         for attempt in range(retries):
             try:
-                async with session.get(url) as r:
+                async with session.get(url, headers=headers) as r:
                     if r.status == 200:
                         data = await r.read()
                         if len(data) > 0:  # Kiểm tra dữ liệu không rỗng
@@ -192,11 +227,29 @@ async def main(product_ids: list[str]):
 
     timeout = aiohttp.ClientTimeout(total=180, connect=30)
     
+    # Headers mặc định cho session (sẽ được override bởi headers cụ thể trong mỗi request)
+    default_headers = get_headers()
+    
+    # Sử dụng CookieJar để lưu cookies và giữ session
+    cookie_jar = CookieJar(unsafe=True)  # unsafe=True để chấp nhận cookies từ mọi domain
+    
     async with aiohttp.ClientSession(
         connector=connector, 
         timeout=timeout,
-        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        headers=default_headers,
+        cookie_jar=cookie_jar
     ) as sess:
+        # Warm-up: request đến trang chủ để lấy cookies ban đầu
+        try:
+            log.info("Đang khởi tạo session...")
+            async with sess.get("https://ec.coleman.co.jp/", headers=get_headers()) as r:
+                if r.status == 200:
+                    log.info("✓ Session đã được khởi tạo")
+                else:
+                    log.warning("⚠️  Warm-up request trả về HTTP %s", r.status)
+        except Exception as e:
+            log.warning("⚠️  Lỗi warm-up: %s (tiếp tục...)", e)
+        
         tasks = [handle_product(pid, sess, sem) for pid in product_ids]
         await tqdm_asyncio.gather(*tasks, desc="Tổng tiến độ", unit="sản phẩm")
 
